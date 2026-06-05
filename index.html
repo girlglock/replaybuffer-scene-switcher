@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>replaybuffer scene switcher</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      background: transparent;
+      overflow: hidden;
+      font-size: clamp(11px, 1.4vw, 16px);
+    }
+
+    #app {
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #config-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: clamp(260px, 45vw, 420px);
+      overflow-y: auto;
+      overflow-x: visible;
+      padding: clamp(0.75rem, 2vw, 1.5rem);
+      box-sizing: border-box;
+      background: var(--pico-background-color);
+      border-left: 1px solid var(--pico-muted-border-color);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(1rem);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+
+    #app:hover #config-panel {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+
+    @media (max-height: 650px) {
+      #config-panel h2 {
+        margin-bottom: 0.5rem;
+        font-size: 1.1em;
+      }
+
+      #config-panel h3 {
+        margin-top: 0.5rem;
+        margin-bottom: 0.25rem;
+      }
+
+      #config-panel input {
+        --pico-form-element-spacing-vertical: 0.375rem;
+      }
+
+      #config-panel small {
+        display: none;
+      }
+
+      #config-panel br {
+        display: none;
+      }
+    }
+
+    .game-scene-row {
+      display: flex;
+      gap: 0.4rem;
+      align-items: center;
+      margin-bottom: 0.4rem;
+    }
+
+    .game-scene-row input {
+      flex: 1;
+      min-width: 0;
+      margin: 0;
+    }
+
+    .game-scene-row button {
+      margin: 0;
+      padding: 0.35rem 0.6rem;
+      width: auto;
+      font-size: 0.8em;
+    }
+
+    .autocomplete-wrap {
+      flex: 1;
+      position: relative;
+      min-width: 0;
+    }
+
+    .autocomplete-wrap input {
+      width: 100%;
+    }
+
+    .autocomplete-list {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: var(--pico-border-radius);
+      max-height: 180px;
+      overflow-y: auto;
+      z-index: 999;
+      margin: 2px 0 0;
+      padding: 0;
+      list-style: none;
+      display: none;
+    }
+
+    .autocomplete-list.open {
+      display: block;
+    }
+
+    .autocomplete-list li {
+      padding: 0.4rem 0.75rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+
+    .autocomplete-list li:hover,
+    .autocomplete-list li.active {
+      background: var(--pico-primary-background);
+      color: var(--pico-primary-inverse);
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <div id="config-panel">
+      <h2>replaybuffer scene switcher</h2>
+
+      <div id="status"
+        style="display:flex; gap:1rem; margin-bottom:1rem; font-size:0.85em; color:var(--pico-muted-color);">
+        <span id="status-obs"></span>
+        <span id="status-lanyard"></span>
+        <span id="status-game"></span>
+      </div>
+
+      <label for="input-userid">Discord User ID</label>
+      <input id="input-userid" type="text" placeholder="123456789012345678" />
+
+      <label for="input-default-scene">Default Scene</label>
+      <input id="input-default-scene" type="text" placeholder="Default" />
+      <small>Scene used when no game is detected or no mapping matches.</small>
+      <br /><br />
+
+      <h3>Game Scenes</h3>
+      <div style="display:flex; gap:0.5rem; margin-bottom:0.25rem;">
+        <small style="flex:1;">Game</small>
+        <small style="flex:1;">Scene</small>
+        <small style="width:2.5rem;"></small>
+      </div>
+      <div id="game-scenes-list"></div>
+    </div>
+  </div>
+  <script>
+    const GAME_PRESETS = [
+      "Apex Legends",
+      "Counter-Strike 2",
+      "Fortnite",
+      "Minecraft",
+      "Overwatch",
+      "Rust",
+      "The Finals",
+      "Valorant",
+    ];
+
+    function loadConfig() {
+      try {
+        const saved = JSON.parse(localStorage.getItem("obs-switcher-config") ?? "{}");
+        return { discordUserId: "", defaultScene: "Default", gameScenes: [], ...saved };
+      } catch {
+        return { discordUserId: "", defaultScene: "Default", gameScenes: [] };
+      }
+    }
+
+    function saveConfig() {
+      localStorage.setItem("obs-switcher-config", JSON.stringify(config));
+    }
+
+    let config = loadConfig();
+
+    document.getElementById("status-obs").textContent = window.obsstudio ? "OBS: ready" : "OBS: not detected";
+
+    function setLanyardStatus(text) {
+      document.getElementById("status-lanyard").textContent = text;
+    }
+
+    function setGameStatus(game) {
+      document.getElementById("status-game").textContent = game ? game : "";
+    }
+
+    function switchScene(name) {
+      if (window.obsstudio && name) window.obsstudio.setCurrentScene(name);
+    }
+
+    let ws = null;
+    let heartbeatTimer = null;
+    let lastGame = undefined;
+
+    function connectLanyard(userId) {
+      if (ws) { ws.onclose = null; ws.close(); ws = null; }
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      if (!userId) return;
+
+      ws = new WebSocket("wss://api.lanyard.rest/socket");
+
+      ws.addEventListener("message", e => {
+        const msg = JSON.parse(e.data);
+        if (msg.op === 1) {
+          setLanyardStatus("Lanyard: connected");
+          heartbeatTimer = setInterval(() => {
+            if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ op: 3 }));
+          }, msg.d.heartbeat_interval);
+          ws.send(JSON.stringify({ op: 2, d: { subscribe_to_id: userId } }));
+        }
+        if (msg.op === 0 && (msg.t === "INIT_STATE" || msg.t === "PRESENCE_UPDATE")) {
+          const game = (msg.d?.activities ?? []).find(a => a.type === 0)?.name ?? null;
+          setGameStatus(game);
+          if (game === lastGame) return;
+          lastGame = game;
+          const match = config.gameScenes.find(s => s.game.trim().toLowerCase() === (game ?? "").toLowerCase());
+          switchScene(match?.scene || config.defaultScene);
+        }
+      });
+
+      ws.addEventListener("close", () => {
+        setLanyardStatus("Lanyard: disconnected");
+        setGameStatus(null);
+        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+        setTimeout(() => connectLanyard(config.discordUserId), 5000);
+      });
+    }
+
+    function makeAutocomplete(placeholder, value, onChange) {
+      const wrap = document.createElement("div");
+      wrap.className = "autocomplete-wrap";
+
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = placeholder;
+      input.value = value;
+
+      const list = document.createElement("ul");
+      list.className = "autocomplete-list";
+
+      let activeIndex = -1;
+
+      function showSuggestions(query) {
+        const q = query.toLowerCase();
+        const matches = q ? GAME_PRESETS.filter(g => g.toLowerCase().includes(q)) : GAME_PRESETS;
+        list.innerHTML = "";
+        activeIndex = -1;
+        if (!matches.length) { list.classList.remove("open"); return; }
+        matches.forEach(name => {
+          const li = document.createElement("li");
+          li.textContent = name;
+          li.addEventListener("mousedown", e => {
+            e.preventDefault();
+            input.value = name;
+            onChange(name);
+            list.classList.remove("open");
+          });
+          list.appendChild(li);
+        });
+        list.classList.add("open");
+      }
+
+      input.addEventListener("focus", () => showSuggestions(input.value));
+      input.addEventListener("input", () => { onChange(input.value); showSuggestions(input.value); });
+      input.addEventListener("blur", () => list.classList.remove("open"));
+      input.addEventListener("keydown", e => {
+        const items = list.querySelectorAll("li");
+        if (e.key === "ArrowDown") { e.preventDefault(); activeIndex = Math.min(activeIndex + 1, items.length - 1); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); activeIndex = Math.max(activeIndex - 1, -1); }
+        else if (e.key === "Enter" && activeIndex >= 0) { e.preventDefault(); input.value = items[activeIndex].textContent; onChange(input.value); list.classList.remove("open"); return; }
+        else if (e.key === "Escape") { list.classList.remove("open"); return; }
+        items.forEach((li, i) => li.classList.toggle("active", i === activeIndex));
+        if (activeIndex >= 0) items[activeIndex].scrollIntoView({ block: "nearest" });
+      });
+
+      wrap.append(input, list);
+      return { wrap, input };
+    }
+
+    function makeRow(id, game, scene) {
+      const row = document.createElement("div");
+      row.className = "game-scene-row";
+
+      const { wrap, input: gameInput } = makeAutocomplete("Game name", game, val => {
+        const m = config.gameScenes.find(m => m.id === id);
+        if (m) { m.game = val; saveConfig(); }
+      });
+
+      const sceneInput = document.createElement("input");
+      sceneInput.type = "text";
+      sceneInput.placeholder = "Scene name";
+      sceneInput.value = scene;
+      sceneInput.addEventListener("input", e => {
+        const m = config.gameScenes.find(m => m.id === id);
+        if (m) { m.scene = e.target.value; saveConfig(); }
+      });
+
+      const del = document.createElement("button");
+      del.textContent = "x";
+      del.className = "secondary outline";
+      del.addEventListener("click", () => {
+        config.gameScenes = config.gameScenes.filter(m => m.id !== id);
+        saveConfig();
+        renderGameScenes();
+      });
+
+      row.append(wrap, sceneInput, del);
+      return row;
+    }
+
+    function appendEmptyRow() {
+      const row = document.createElement("div");
+      row.className = "game-scene-row";
+
+      const { wrap, input: gameInput } = makeAutocomplete("Game name", "", () => { });
+
+      const sceneInput = document.createElement("input");
+      sceneInput.type = "text";
+      sceneInput.placeholder = "Scene name";
+
+      const del = document.createElement("button");
+      del.textContent = "x";
+      del.className = "secondary outline";
+      del.style.visibility = "hidden";
+
+      let saved = false;
+      const trySave = () => {
+        if (saved || !gameInput.value.trim() || !sceneInput.value.trim()) return;
+        saved = true;
+        config.gameScenes.push({ id: crypto.randomUUID(), game: gameInput.value.trim(), scene: sceneInput.value.trim() });
+        saveConfig();
+        renderGameScenes();
+      };
+
+      gameInput.addEventListener("blur", trySave);
+      sceneInput.addEventListener("blur", trySave);
+
+      row.append(wrap, sceneInput, del);
+      document.getElementById("game-scenes-list").appendChild(row);
+    }
+
+    function renderGameScenes() {
+      const list = document.getElementById("game-scenes-list");
+      list.innerHTML = "";
+      config.gameScenes.forEach(({ id, game, scene }) => list.appendChild(makeRow(id, game, scene)));
+      appendEmptyRow();
+    }
+
+    document.getElementById("input-userid").value = config.discordUserId;
+    document.getElementById("input-default-scene").value = config.defaultScene;
+
+    document.getElementById("input-userid").addEventListener("change", e => {
+      config.discordUserId = e.target.value.trim();
+      saveConfig();
+      lastGame = undefined;
+      connectLanyard(config.discordUserId);
+    });
+
+    document.getElementById("input-default-scene").addEventListener("change", e => {
+      config.defaultScene = e.target.value.trim() || "Default";
+      document.getElementById("input-default-scene").value = config.defaultScene;
+      saveConfig();
+    });
+
+    renderGameScenes();
+    connectLanyard(config.discordUserId);
+  </script>
+</body>
+
+</html>
