@@ -15,6 +15,8 @@ _stop = threading.Event()
 _ws_thread = None
 _current_ws = None
 _settings_ref = None
+_status = "Not configured"
+_active_user_id = None
 
 
 def script_description():
@@ -46,11 +48,9 @@ def script_properties():
 
     obs.obs_properties_add_text(p, "game_mappings", "Game Mappings (one per line)", obs.OBS_TEXT_MULTILINE)
     obs.obs_properties_add_button(p, "add_btn", "Add Current Game", _add_current_game)
+    obs.obs_properties_add_text(p, "lanyard_status", "Lanyard Status", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_button(p, "refresh_btn", "Refresh Status", _refresh_status)
     return p
-
-
-def script_defaults(settings):
-    pass
 
 
 def script_update(settings):
@@ -69,7 +69,7 @@ def script_update(settings):
     _reconnect()
 
 
-def script_load(settings):
+def script_load(_):
     obs.timer_add(_drain_pending, 250)
 
 
@@ -83,14 +83,25 @@ def script_unload():
             pass
 
 
+def _set_status(text):
+    global _status
+    _status = text
+
+
+def _refresh_status(*_):
+    if _settings_ref:
+        obs.obs_data_set_string(_settings_ref, "lanyard_status", _status)
+    return True
+
+
 def _add_current_game(props, prop):
     if not _last_game:
-        obs.script_log(obs.LOG_WARNING, "[game-switcher] No game detected yet, is Discord running?")
+        obs.script_log(obs.LOG_INFO, "[game-switcher] No game detected yet, is Discord running?")
         return True
 
     src = obs.obs_get_source_by_name(_cfg['source'])
     if not src:
-        obs.script_log(obs.LOG_WARNING, f"[game-switcher] Source not found: '{_cfg['source']}'")
+        obs.script_log(obs.LOG_INFO, f"[game-switcher] Source not found: '{_cfg['source']}'")
         return True
 
     src_settings = obs.obs_source_get_settings(src)
@@ -99,7 +110,7 @@ def _add_current_game(props, prop):
     obs.obs_source_release(src)
 
     if not window:
-        obs.script_log(obs.LOG_WARNING,
+        obs.script_log(obs.LOG_INFO,
             "[game-switcher] Game Capture has no window selected, "
             "set it to Capture specific window and pick the game first.")
         return True
@@ -124,7 +135,7 @@ def _drain_pending():
 def _apply_window(window):
     src = obs.obs_get_source_by_name(_cfg['source'])
     if not src:
-        obs.script_log(obs.LOG_WARNING, f"[game-switcher] Source not found: '{_cfg['source']}'")
+        obs.script_log(obs.LOG_INFO, f"[game-switcher] Source not found: '{_cfg['source']}'")
         return
     d = obs.obs_data_create()
     obs.obs_data_set_string(d, "window", window)
@@ -153,6 +164,7 @@ def _lanyard_thread(user_id, stop_event):
             if op == 1:
                 interval = msg['d']['heartbeat_interval'] / 1000
                 ws.send(json.dumps({'op': 2, 'd': {'subscribe_to_id': user_id}}))
+                _set_status("Connected")
                 def heartbeat():
                     while not stop_event.wait(interval):
                         try:
@@ -162,14 +174,21 @@ def _lanyard_thread(user_id, stop_event):
                 threading.Thread(target=heartbeat, daemon=True).start()
             elif op == 0 and msg.get('t') in ('INIT_STATE', 'PRESENCE_UPDATE'):
                 acts = msg.get('d', {}).get('activities', [])
-                _on_game(next((a['name'] for a in acts if a.get('type') == 0), None))
+                game = next((a['name'] for a in acts if a.get('type') == 0), None)
+                _set_status(f"Connected  |  playing: {game}" if game else "Connected  |  no game")
+                _on_game(game)
         except Exception as e:
-            obs.script_log(obs.LOG_WARNING, f"[game-switcher] Message error: {e}")
+            obs.script_log(obs.LOG_INFO, f"[game-switcher] Message error: {e}")
 
     def on_error(ws, error):
-        obs.script_log(obs.LOG_WARNING, f"[game-switcher] WS error: {error}")
+        if isinstance(error, (websocket.WebSocketException, TimeoutError)):
+            return
+        if isinstance(error, AttributeError) and 'sock' in str(error):
+            return
+        obs.script_log(obs.LOG_INFO, f"[game-switcher] WS error: {error}")
 
     while not stop_event.is_set():
+        _set_status("Connecting...")
         try:
             ws = websocket.WebSocketApp(
                 "wss://api.lanyard.rest/socket",
@@ -180,14 +199,21 @@ def _lanyard_thread(user_id, stop_event):
             ws.run_forever()
             _current_ws = None
         except Exception as e:
-            obs.script_log(obs.LOG_WARNING, f"[game-switcher] Connection error: {e}")
+            obs.script_log(obs.LOG_INFO, f"[game-switcher] Connection error: {e}")
         if not stop_event.is_set():
+            _set_status("Reconnecting in 5s...")
             obs.script_log(obs.LOG_INFO, "[game-switcher] Reconnecting in 5s...")
             stop_event.wait(5)
 
 
 def _reconnect():
-    global _stop, _ws_thread
+    global _stop, _ws_thread, _active_user_id
+    new_user_id = _cfg['user_id']
+
+    if new_user_id and new_user_id == _active_user_id and _ws_thread and _ws_thread.is_alive():
+        return
+
+    _active_user_id = new_user_id
     _stop.set()
     if _current_ws:
         try:
@@ -197,10 +223,12 @@ def _reconnect():
     if _ws_thread and _ws_thread.is_alive():
         _ws_thread.join(timeout=3)
     _stop = threading.Event()
-    if _cfg['user_id']:
+    if new_user_id:
         _ws_thread = threading.Thread(
             target=_lanyard_thread,
-            args=(_cfg['user_id'], _stop),
+            args=(new_user_id, _stop),
             daemon=True,
         )
         _ws_thread.start()
+    else:
+        _set_status("Not configured")
